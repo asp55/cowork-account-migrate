@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+._*
+
+# Staging directory (created during export)
+cowork-migration/
+
+# Backups
+cowork-backup-*/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
