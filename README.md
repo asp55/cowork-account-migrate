@@ -1,10 +1,16 @@
 # cowork-migrate
 
-Migrate [Claude Desktop](https://claude.ai) Cowork sessions between Macs.
+Sync [Claude Desktop](https://claude.ai) Cowork sessions between Macs.
 
-When switching to a new Mac, your Cowork session history, conversation logs, output files, and uploads may not fully sync. This tool exports everything from your old Mac and imports it onto your new one, with automatic path rewriting if your macOS username changed.
+Claude Desktop's Cowork mode stores session data locally — conversation history, output files, and uploads don't fully sync across machines. If you work on a desktop at home and a laptop on the road, your sessions won't follow you. This tool bridges the gap until Anthropic ships native cloud sync.
 
-## What It Migrates
+**Use cases:**
+
+- Keep the same Cowork sessions on your desktop and laptop
+- Migrate sessions when upgrading to a new Mac
+- Back up your Cowork session data locally
+
+## What It Syncs
 
 Each Cowork session consists of:
 
@@ -23,17 +29,17 @@ Each Cowork session consists of:
 
 ## Quick Start
 
-### Step 1: Export from your old Mac
+### Step 1: Export from the source Mac
 
 ```bash
-git clone https://github.com/DBSS/cowork-migrate.git
+git clone https://github.com/DRVBSS/cowork-migrate.git
 cd cowork-migrate
 ./migrate.sh export
 ```
 
 This creates `~/cowork-migration/` containing all your sessions.
 
-### Step 2: Transfer to your new Mac
+### Step 2: Transfer to the other Mac
 
 Use any method to copy the `~/cowork-migration` folder:
 
@@ -41,24 +47,29 @@ Use any method to copy the `~/cowork-migration` folder:
 # AirDrop — right-click the folder in Finder, Share > AirDrop
 
 # SCP over network
-scp -r ~/cowork-migration user@new-mac.local:~/
+scp -r ~/cowork-migration user@other-mac.local:~/
 
 # USB/Thunderbolt drive
 cp -R ~/cowork-migration /Volumes/MyDrive/
+
+# Synology/NAS — copy to a shared folder
+cp -R ~/cowork-migration /Volumes/NAS-Share/
 ```
 
-### Step 3: Install on your new Mac
+### Step 3: Install on the target Mac
 
 ```bash
 cd ~/cowork-migration
 ./migrate.sh install
 ```
 
+New sessions are added. Existing sessions are skipped (use `--force` to overwrite).
+
 ### Step 4: Restart Claude Desktop
 
-Quit Claude Desktop (Cmd+Q) and reopen it. Your migrated sessions should appear in the Cowork sidebar.
+Quit Claude Desktop (Cmd+Q) and reopen it. Your sessions should appear in the Cowork sidebar.
 
-### Step 5: Verify the migration
+### Step 5: Verify
 
 ```bash
 ./migrate.sh verify
@@ -70,6 +81,25 @@ Or use the standalone verification script for a more detailed check:
 ./verify.sh --verbose
 ```
 
+## Ongoing Sync Between Two Macs
+
+To keep sessions in sync as you work across machines, run the export/transfer/install cycle whenever you switch. A typical workflow:
+
+1. Finish working on Mac A
+2. Run `./migrate.sh export` on Mac A
+3. Transfer `~/cowork-migration` to Mac B (AirDrop, SCP, NAS, etc.)
+4. Run `./migrate.sh install --force` on Mac B
+5. Restart Claude Desktop on Mac B
+
+The `--force` flag ensures that sessions updated on Mac A overwrite the older versions on Mac B. Without it, existing sessions are skipped.
+
+**Tip:** If both machines are on the same network, you can do it in one shot from Mac B:
+
+```bash
+scp -r user@mac-a.local:~/cowork-migration ~/
+cd ~/cowork-migration && ./migrate.sh install --force
+```
+
 ## Commands
 
 | Command | Description |
@@ -77,7 +107,7 @@ Or use the standalone verification script for a more detailed check:
 | `./migrate.sh export` | Export all sessions to `~/cowork-migration/` |
 | `./migrate.sh install` | Import sessions from `~/cowork-migration/` |
 | `./migrate.sh install --force` | Import and overwrite existing sessions |
-| `./migrate.sh verify` | Verify all sessions are healthy after migration |
+| `./migrate.sh verify` | Verify all sessions are healthy after sync |
 | `./migrate.sh list` | List all Cowork sessions on this Mac |
 | `./migrate.sh backup` | Create a timestamped backup of all sessions |
 
@@ -133,11 +163,11 @@ local_<session-uuid>/              # Session data directory
   .claude/                         # Internal working state
 ```
 
-The migration tool:
+The tool:
 
 1. **Export** — copies all session JSON files and their directories into a portable staging folder
 2. **Install** — copies sessions into the target Mac's Claude session directory, skipping any that already exist (unless `--force` is used)
-3. **Path rewriting** — if the macOS username differs between machines (e.g., `john` on the old Mac, `johnsmith` on the new Mac), all file paths inside JSON and JSONL files are automatically rewritten
+3. **Path rewriting** — if the macOS username differs between machines (e.g., `john` on the desktop, `johnsmith` on the laptop), all file paths inside JSON and JSONL files are automatically rewritten
 
 ## Common Scenarios
 
@@ -153,7 +183,7 @@ Some sessions may sync their metadata via your Claude account but not the actual
 
 Handled automatically. The tool detects the source username from paths inside the session files and rewrites them to match the current user. No manual configuration needed.
 
-### Checking what's on your Mac before migrating
+### Checking what's on your Mac before syncing
 
 ```bash
 ./migrate.sh list
@@ -209,6 +239,7 @@ chmod +x migrate.sh
 
 - Migrated sessions may not be resumable (Cowork might treat them as read-only history)
 - The conversation log and all files are preserved for reference
+- This is a community workaround until Anthropic adds native cloud sync for Cowork sessions
 - This tool works with the local session storage format as of Claude Desktop v1.x (February 2025). Future versions may change the storage format.
 
 ## Contributing
