@@ -202,34 +202,49 @@ print(datetime.datetime.fromtimestamp(ts/1000).strftime('%Y-%m-%d %H:%M'))
             session_warnings="${session_warnings}    ${GREEN}OK${NC}    Conversation log: $audit_lines entries ($audit_size)\n"
         fi
 
-        # CHECK 4: Stale username paths
+        # CHECK 4: Stale username paths (metadata + all inner session files)
+        # Scans the same file set that migrate.sh rewrites — .json/.jsonl/.md
+        # plus anything under .claude/ — and skips outputs/ and uploads/.
         stale_user=""
         stale_match=$(grep -ohm1 '/Users/[^/"]*/' "$json_file" 2>/dev/null | grep -v "/Users/${CURRENT_USER}/" | head -1 || true)
+        if [ -z "$stale_match" ]; then
+            stale_match=$(find "$sess_dir" -type f \
+                \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" -o -path "*/.claude/*" \) \
+                -not -path "*/outputs/*" -not -path "*/uploads/*" \
+                -print0 2>/dev/null \
+                | xargs -0 grep -ohm1 '/Users/[^/"]*/' 2>/dev/null \
+                | grep -v "/Users/${CURRENT_USER}/" | head -1 || true)
+        fi
         if [ -n "$stale_match" ]; then
             stale_user=$(echo "$stale_match" | sed 's|/Users/||;s|/||')
         fi
 
         if [ -n "$stale_user" ]; then
             stale_count_meta=$(grep -c "/Users/${stale_user}/" "$json_file" 2>/dev/null || echo "0")
-            stale_count_audit=0
-            if [ -f "$audit_file" ]; then
-                stale_count_audit=$(grep -c "/Users/${stale_user}/" "$audit_file" 2>/dev/null || echo "0")
-            fi
+            stale_files_inner=$(find "$sess_dir" -type f \
+                \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" -o -path "*/.claude/*" \) \
+                -not -path "*/outputs/*" -not -path "*/uploads/*" \
+                -print0 2>/dev/null \
+                | xargs -0 grep -l "/Users/${stale_user}/" 2>/dev/null \
+                | wc -l | tr -d ' ')
 
-            session_warnings="${session_warnings}    ${YELLOW}WARN${NC}  Contains /Users/${stale_user}/ paths (metadata: ${stale_count_meta}, audit: ${stale_count_audit})\n"
+            session_warnings="${session_warnings}    ${YELLOW}WARN${NC}  Contains /Users/${stale_user}/ paths (metadata: ${stale_count_meta} hits, inner files: ${stale_files_inner})\n"
             session_issues=$((session_issues + 1))
             WARN_COUNT=$((WARN_COUNT + 1))
 
             if [ "$FIX_PATHS" = "true" ]; then
-                sed -i '' "s|/Users/${stale_user}/|/Users/${CURRENT_USER}/|g" "$json_file"
-                session_warnings="${session_warnings}    ${GREEN}FIXED${NC} Rewrote paths in metadata: /Users/${stale_user}/ -> /Users/${CURRENT_USER}/\n"
-
-                find "$sess_dir" \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" \) -print0 2>/dev/null | while IFS= read -r -d '' inner_file; do
+                if grep -q "/Users/${stale_user}/" "$json_file" 2>/dev/null; then
+                    sed -i '' "s|/Users/${stale_user}/|/Users/${CURRENT_USER}/|g" "$json_file"
+                fi
+                find "$sess_dir" -type f \
+                    \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" -o -path "*/.claude/*" \) \
+                    -not -path "*/outputs/*" -not -path "*/uploads/*" \
+                    -print0 2>/dev/null | while IFS= read -r -d '' inner_file; do
                     if grep -q "/Users/${stale_user}/" "$inner_file" 2>/dev/null; then
                         sed -i '' "s|/Users/${stale_user}/|/Users/${CURRENT_USER}/|g" "$inner_file"
                     fi
                 done
-                session_warnings="${session_warnings}    ${GREEN}FIXED${NC} Rewrote paths in session files\n"
+                session_warnings="${session_warnings}    ${GREEN}FIXED${NC} Rewrote /Users/${stale_user}/ -> /Users/${CURRENT_USER}/ across metadata and session files\n"
                 FIXED=$((FIXED + 1))
             fi
         elif [ "$VERBOSE" = "true" ]; then
@@ -285,6 +300,67 @@ for p in all_paths:
             if [ "$VERBOSE" = "true" ] && [ "$upload_count" -gt 0 ]; then
                 session_warnings="${session_warnings}    ${GREEN}OK${NC}    Uploaded files: $upload_count\n"
             fi
+        fi
+
+        # CHECK 8: UUID consistency
+        # Every accountUuid/organizationUuid value inside the session's files
+        # should match the directory location (pair_acc/pair_sub). A mismatch
+        # usually means a cross-account remap install left stale references.
+        uuid_report=$(python3 - "$pair_acc" "$pair_sub" "$json_file" "$sess_dir" <<'PYEOF' 2>/dev/null || true
+import os, re, sys
+pair_acc, pair_sub, metadata, sess_dir = sys.argv[1:5]
+bad_acc, bad_sub = set(), set()
+acc_re = re.compile(r'"accountUuid"\s*:\s*"([0-9a-fA-F-]+)"')
+sub_re = re.compile(r'"organizationUuid"\s*:\s*"([0-9a-fA-F-]+)"')
+
+def scan(path):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            data = f.read()
+    except Exception:
+        return
+    for m in acc_re.finditer(data):
+        if m.group(1) != pair_acc:
+            bad_acc.add(m.group(1))
+    for m in sub_re.finditer(data):
+        if m.group(1) != pair_sub:
+            bad_sub.add(m.group(1))
+
+if os.path.isfile(metadata):
+    scan(metadata)
+
+if os.path.isdir(sess_dir):
+    for root, dirs, files in os.walk(sess_dir):
+        rel_parts = os.path.relpath(root, sess_dir).split(os.sep)
+        if 'outputs' in rel_parts or 'uploads' in rel_parts:
+            continue
+        under_claude = '.claude' in rel_parts
+        for fname in files:
+            if not (fname.endswith('.json') or fname.endswith('.jsonl')
+                    or fname.endswith('.md') or under_claude):
+                continue
+            scan(os.path.join(root, fname))
+
+print('|'.join(sorted(bad_acc)))
+print('|'.join(sorted(bad_sub)))
+PYEOF
+)
+        bad_accs=$(echo "$uuid_report" | sed -n '1p')
+        bad_subs=$(echo "$uuid_report" | sed -n '2p')
+
+        if [ -n "$bad_accs" ]; then
+            session_warnings="${session_warnings}    ${YELLOW}WARN${NC}  accountUuid mismatch — expected ${pair_acc}, found: ${bad_accs}\n"
+            session_issues=$((session_issues + 1))
+            WARN_COUNT=$((WARN_COUNT + 1))
+        elif [ "$VERBOSE" = "true" ]; then
+            session_warnings="${session_warnings}    ${GREEN}OK${NC}    accountUuid matches directory (${pair_acc})\n"
+        fi
+        if [ -n "$bad_subs" ]; then
+            session_warnings="${session_warnings}    ${YELLOW}WARN${NC}  organizationUuid mismatch — expected ${pair_sub}, found: ${bad_subs}\n"
+            session_issues=$((session_issues + 1))
+            WARN_COUNT=$((WARN_COUNT + 1))
+        elif [ "$VERBOSE" = "true" ]; then
+            session_warnings="${session_warnings}    ${GREEN}OK${NC}    organizationUuid matches directory (${pair_sub})\n"
         fi
 
         # CHECK 7: Total file count in session

@@ -141,6 +141,8 @@ Checks performed:
 | `--account=<uuid>` | Pre-select an account-uuid (skip the interactive prompt) |
 | `--sub=<uuid>` | Pre-select a sub-uuid (skip the interactive prompt) |
 | `--all` | Select every `(account/sub)` pair found on this Mac (export only) |
+| `--target-account=<uuid>` | Install into a different account-uuid; UUIDs inside session files are rewritten to match (install only) |
+| `--target-sub=<uuid>` | Install into a different sub-uuid; UUIDs inside session files are rewritten to match (install only) |
 | `--help` | Show usage information |
 
 ### Environment Variables
@@ -189,6 +191,28 @@ Some sessions may sync their metadata via your Claude account but not the actual
 ### Different usernames on each Mac
 
 Handled automatically. The tool detects the source username from paths inside the session files and rewrites them to match the current user. No manual configuration needed.
+
+### Migrating sessions from one Claude account into another
+
+Use `--target-account` and/or `--target-sub` on `install` to move sessions across accounts (or across workspaces within the same account). The tool writes the session into the target `<account-uuid>/<sub-uuid>/` directory and rewrites every reference to the source UUIDs inside the session metadata, `audit.jsonl`, and the internal `.claude/` files. Files you uploaded or that Cowork generated under `outputs/` and `uploads/` are left untouched.
+
+```bash
+# 1) On the source Mac, export the pair you want to migrate
+./migrate.sh export --account=AAA-... --sub=BBB-...
+
+# 2) Transfer ~/cowork-migration to the target Mac, then list the
+#    pairs that already exist for the destination account:
+./migrate.sh list
+
+# 3) Install the source pair into the destination pair
+./migrate.sh install \
+    --account=AAA-... --sub=BBB-... \
+    --target-account=CCC-... --target-sub=DDD-...
+```
+
+Either `--target-account` or `--target-sub` can be set on its own — the unset side preserves the source UUID. Because the rewrite is destructive on the installed copy, the staging folder is left unchanged and you can re-run with `--force` if anything goes wrong.
+
+Remapping is only allowed when staging contains exactly one source pair — use `--account` / `--sub` to pick one if you exported several at once.
 
 ### Multiple Claude accounts on one Mac
 

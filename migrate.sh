@@ -30,6 +30,8 @@ SESSION_BASE="$HOME/Library/Application Support/Claude/local-agent-mode-sessions
 # --- Selection flags (populated in main) ---
 ACCOUNT_UUID=""
 SUB_UUID=""
+TARGET_ACCOUNT_UUID=""
+TARGET_SUB_UUID=""
 SELECT_ALL=false
 
 # ============================================================
@@ -212,6 +214,38 @@ select_pairs() {
 }
 
 # ============================================================
+#  rewrite_in_files <dir> <from-string> <to-string>
+#  Replace every occurrence of <from-string> with <to-string>
+#  across the session metadata/log files under <dir>. Skips
+#  user data in outputs/ and uploads/ so binary files stay
+#  untouched.
+# ============================================================
+rewrite_in_files() {
+    local dir="$1"
+    local from="$2"
+    local to="$3"
+
+    [ -d "$dir" ] || return 0
+    [ -n "$from" ] && [ -n "$to" ] || return 0
+    [ "$from" = "$to" ] && return 0
+
+    local sed_from sed_to
+    sed_from=$(printf '%s' "$from" | sed 's/[][\\/.^$*]/\\&/g')
+    sed_to=$(printf '%s' "$to" | sed 's/[\\/&]/\\&/g')
+
+    find "$dir" -type f \
+        \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" -o -path "*/.claude/*" \) \
+        -not -path "*/outputs/*" \
+        -not -path "*/uploads/*" \
+        -print0 2>/dev/null \
+    | while IFS= read -r -d '' inner_file; do
+        if grep -q "$from" "$inner_file" 2>/dev/null; then
+            sed -i '' "s/${sed_from}/${sed_to}/g" "$inner_file"
+        fi
+    done
+}
+
+# ============================================================
 #  Show usage
 # ============================================================
 show_usage() {
@@ -228,12 +262,14 @@ show_usage() {
     echo "  backup     Create a backup of all sessions on this Mac"
     echo ""
     echo "Options:"
-    echo "  --force                Overwrite existing sessions during install"
-    echo "  --dry-run              Show what would be done without making changes"
-    echo "  --account=<uuid>       Pre-select an account-uuid (skip prompt)"
-    echo "  --sub=<uuid>           Pre-select a sub-uuid (skip prompt)"
-    echo "  --all                  Select all (account/sub) pairs (export only)"
-    echo "  --help                 Show this help message"
+    echo "  --force                  Overwrite existing sessions during install"
+    echo "  --dry-run                Show what would be done without making changes"
+    echo "  --account=<uuid>         Pre-select an account-uuid (skip prompt)"
+    echo "  --sub=<uuid>             Pre-select a sub-uuid (skip prompt)"
+    echo "  --all                    Select all (account/sub) pairs (export only)"
+    echo "  --target-account=<uuid>  Remap into a different account-uuid on install"
+    echo "  --target-sub=<uuid>      Remap into a different sub-uuid on install"
+    echo "  --help                   Show this help message"
     echo ""
     echo "Environment variables:"
     echo "  COWORK_STAGING_DIR     Override staging directory"
@@ -251,6 +287,11 @@ show_usage() {
     echo ""
     echo "  # Install everything in staging onto the target Mac"
     echo "  ./migrate.sh install"
+    echo ""
+    echo "  # Migrate sessions from account AAA into account CCC on this Mac"
+    echo "  # (rewrites UUIDs inside session files to match the target)"
+    echo "  ./migrate.sh install --account=AAA --sub=BBB \\"
+    echo "                       --target-account=CCC --target-sub=DDD"
     echo ""
 }
 
@@ -514,6 +555,17 @@ do_install() {
         exit 1
     fi
 
+    local remap_uuids=false
+    if [ -n "$TARGET_ACCOUNT_UUID" ] || [ -n "$TARGET_SUB_UUID" ]; then
+        remap_uuids=true
+        if [ ${#staging_pairs[@]} -gt 1 ]; then
+            echo -e "${RED}ERROR: --target-account/--target-sub require a single source pair.${NC}"
+            echo "  Staging contains ${#staging_pairs[@]} pairs. Use --account=<uuid> --sub=<uuid>"
+            echo "  to pick exactly one source pair when remapping UUIDs."
+            exit 1
+        fi
+    fi
+
     local source_username="" exported_from="" exported_at=""
     if [ -f "$STAGING_DIR/migration_info.json" ]; then
         source_username=$(python3 -c "import json; print(json.load(open('$STAGING_DIR/migration_info.json')).get('source_username', ''))" 2>/dev/null || echo "")
@@ -547,16 +599,23 @@ do_install() {
     echo ""
 
     local copied=0 skipped=0 overwritten=0 errors=0
-    local stage_pair acc sub target_pair json_file filename session_id title target_json
-    local staged_session_dir target_session_dir file_count inner_file
+    local stage_pair src_acc src_sub tgt_acc tgt_sub target_pair
+    local json_file filename session_id title target_json
+    local staged_session_dir target_session_dir file_count
 
     for stage_pair in "${staging_pairs[@]}"; do
-        acc=$(basename "$(dirname "$stage_pair")")
-        sub=$(basename "$stage_pair")
-        target_pair="$SESSION_BASE/$acc/$sub"
+        src_acc=$(basename "$(dirname "$stage_pair")")
+        src_sub=$(basename "$stage_pair")
+        tgt_acc="${TARGET_ACCOUNT_UUID:-$src_acc}"
+        tgt_sub="${TARGET_SUB_UUID:-$src_sub}"
+        target_pair="$SESSION_BASE/$tgt_acc/$tgt_sub"
 
-        echo -e "  ${CYAN}pair${NC}    account=$acc"
-        echo -e "          sub=$sub"
+        echo -e "  ${CYAN}pair${NC}    source: account=$src_acc"
+        echo -e "          source: sub=$src_sub"
+        if [ "$remap_uuids" = "true" ]; then
+            echo -e "          ${CYAN}target: account=$tgt_acc${NC}"
+            echo -e "          ${CYAN}target: sub=$tgt_sub${NC}"
+        fi
 
         if [ ! -d "$target_pair" ]; then
             echo -e "          ${YELLOW}target dir does not exist; creating${NC}"
@@ -598,12 +657,6 @@ do_install() {
                 continue
             fi
 
-            if [ "$needs_path_rewrite" = "true" ]; then
-                if grep -q "/Users/${source_username}/" "$target_json" 2>/dev/null; then
-                    sed -i '' "s|/Users/${source_username}/|/Users/${target_username}/|g" "$target_json"
-                fi
-            fi
-
             staged_session_dir="$stage_pair/$session_id"
             target_session_dir="$target_pair/$session_id"
 
@@ -620,13 +673,30 @@ do_install() {
 
                 file_count=$(find "$target_session_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
                 echo "               -> $file_count files"
+            fi
 
-                if [ "$needs_path_rewrite" = "true" ]; then
-                    find "$target_session_dir" \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" \) -print0 2>/dev/null | while IFS= read -r -d '' inner_file; do
-                        if grep -q "/Users/${source_username}/" "$inner_file" 2>/dev/null; then
-                            sed -i '' "s|/Users/${source_username}/|/Users/${target_username}/|g" "$inner_file"
-                        fi
-                    done
+            # Username path rewrite (covers metadata + all inner files)
+            if [ "$needs_path_rewrite" = "true" ]; then
+                if grep -q "/Users/${source_username}/" "$target_json" 2>/dev/null; then
+                    sed -i '' "s|/Users/${source_username}/|/Users/${target_username}/|g" "$target_json"
+                fi
+                rewrite_in_files "$target_session_dir" \
+                    "/Users/${source_username}/" "/Users/${target_username}/"
+            fi
+
+            # UUID remap rewrite (account-uuid and sub-uuid inside file contents)
+            if [ "$remap_uuids" = "true" ]; then
+                if [ "$src_acc" != "$tgt_acc" ]; then
+                    if grep -q "$src_acc" "$target_json" 2>/dev/null; then
+                        sed -i '' "s/${src_acc}/${tgt_acc}/g" "$target_json"
+                    fi
+                    rewrite_in_files "$target_session_dir" "$src_acc" "$tgt_acc"
+                fi
+                if [ "$src_sub" != "$tgt_sub" ]; then
+                    if grep -q "$src_sub" "$target_json" 2>/dev/null; then
+                        sed -i '' "s/${src_sub}/${tgt_sub}/g" "$target_json"
+                    fi
+                    rewrite_in_files "$target_session_dir" "$src_sub" "$tgt_sub"
                 fi
             fi
 
@@ -883,6 +953,8 @@ for arg in "$@"; do
         --all) SELECT_ALL=true ;;
         --account=*) ACCOUNT_UUID="${arg#--account=}" ;;
         --sub=*) SUB_UUID="${arg#--sub=}" ;;
+        --target-account=*) TARGET_ACCOUNT_UUID="${arg#--target-account=}" ;;
+        --target-sub=*) TARGET_SUB_UUID="${arg#--target-sub=}" ;;
         --help) show_usage; exit 0 ;;
     esac
 done
