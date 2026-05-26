@@ -37,7 +37,9 @@ cd cowork-migrate
 ./migrate.sh export
 ```
 
-This creates `~/cowork-migration/` containing all your sessions.
+This creates `~/cowork-migration/` containing your sessions.
+
+If you have more than one Claude account logged in (or Claude has created more than one workspace) the tool will list the available `(account-uuid / sub-uuid)` pairs and let you pick which one to export. Pick `A` to export them all in one go, or pass `--all` to skip the prompt. For scripted runs, use `--account=<uuid> --sub=<uuid>` to target a specific pair.
 
 ### Step 2: Transfer to the other Mac
 
@@ -136,6 +138,9 @@ Checks performed:
 |------|-------------|
 | `--force` | Overwrite sessions that already exist on the target Mac |
 | `--dry-run` | Preview what would happen without making changes |
+| `--account=<uuid>` | Pre-select an account-uuid (skip the interactive prompt) |
+| `--sub=<uuid>` | Pre-select a sub-uuid (skip the interactive prompt) |
+| `--all` | Select every `(account/sub)` pair found on this Mac (export only) |
 | `--help` | Show usage information |
 
 ### Environment Variables
@@ -152,7 +157,7 @@ Claude Desktop stores Cowork sessions locally at:
 ~/Library/Application Support/Claude/local-agent-mode-sessions/<account-uuid>/<sub-uuid>/
 ```
 
-The two UUID directories are tied to your Claude account (not the machine), so they're identical across all Macs logged into the same account. Each session has:
+A Mac can have several of these `(account-uuid / sub-uuid)` pairs — typically one per Claude account you've logged into, sometimes more if Claude has created additional workspaces. Each pair is independent and contains its own set of sessions:
 
 ```
 local_<session-uuid>.json          # Metadata (title, date, model, etc.)
@@ -165,9 +170,11 @@ local_<session-uuid>/              # Session data directory
 
 The tool:
 
-1. **Export** — copies all session JSON files and their directories into a portable staging folder
-2. **Install** — copies sessions into the target Mac's Claude session directory, skipping any that already exist (unless `--force` is used)
-3. **Path rewriting** — if the macOS username differs between machines (e.g., `john` on the desktop, `johnsmith` on the laptop), all file paths inside JSON and JSONL files are automatically rewritten
+1. **Export** — enumerates every `(account/sub)` pair on this Mac; if there's more than one, prompts you to pick which one (or `A` for all). Copies the selected pair(s) into the staging folder, preserving the hierarchy: `~/cowork-migration/sessions/<account-uuid>/<sub-uuid>/`
+2. **Install** — finds every pair inside the staging folder and copies each into the target Mac's matching `<account-uuid>/<sub-uuid>/` location (creating those directories if Claude Desktop hasn't yet). Sessions that already exist are skipped unless `--force` is used.
+3. **Path rewriting** — if the macOS username differs between machines (e.g., `john` on the desktop, `johnsmith` on the laptop), all file paths inside JSON and JSONL files are automatically rewritten.
+
+`list`, `verify`, and `backup` all iterate across every pair found on this Mac and group their output per pair. You can scope any command to a single pair with `--account=<uuid> --sub=<uuid>`.
 
 ## Common Scenarios
 
@@ -182,6 +189,32 @@ Some sessions may sync their metadata via your Claude account but not the actual
 ### Different usernames on each Mac
 
 Handled automatically. The tool detects the source username from paths inside the session files and rewrites them to match the current user. No manual configuration needed.
+
+### Multiple Claude accounts on one Mac
+
+If you've logged into more than one Claude account, `~/Library/Application Support/Claude/local-agent-mode-sessions/` will contain multiple `<account-uuid>/` directories. Each command lists them and lets you choose:
+
+```bash
+./migrate.sh export
+# Multiple (account-uuid / sub-uuid) pairs found
+# ============================================================
+#
+#   1) account: 84ffcfc5-8f16-4701-89c1-7dd74a5334ba
+#      sub:     13181e23-288a-4768-912b-646e119ecc3b
+#      sessions: 21
+#
+#   2) account: 9a2b...
+#      sub:     7c4d...
+#      sessions: 8
+#
+#   A) All pairs
+#
+#   Select [1-2 or A]:
+```
+
+Pick a number to export just that account, or `A` to export everything. To pre-select non-interactively, pass `--account=<uuid>` and/or `--sub=<uuid>`, or `--all`.
+
+`list`, `verify`, and `backup` always operate across every pair (and group their output per pair). Scope any of them to a single account with the same `--account` / `--sub` flags.
 
 ### Checking what's on your Mac before syncing
 

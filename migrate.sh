@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -27,54 +27,188 @@ NC='\033[0m'
 STAGING_DIR="${COWORK_STAGING_DIR:-$HOME/cowork-migration}"
 SESSION_BASE="$HOME/Library/Application Support/Claude/local-agent-mode-sessions"
 
+# --- Selection flags (populated in main) ---
+ACCOUNT_UUID=""
+SUB_UUID=""
+SELECT_ALL=false
+
 # ============================================================
-#  Auto-detect the session directory
+#  Layout
 # ============================================================
-# Claude stores sessions under two levels of UUID directories
-# tied to the user's account. These are the same across all
-# Macs logged into the same Claude account.
+# Claude stores sessions under two levels of UUID directories:
 #
-# Structure:
 #   ~/Library/Application Support/Claude/
 #     local-agent-mode-sessions/
-#       <account-uuid>/
-#         <sub-uuid>/
-#           local_<session-uuid>.json    (metadata)
-#           local_<session-uuid>/        (conversation data)
-#             audit.jsonl                (full conversation log)
-#             outputs/                   (files created by Cowork)
-#             uploads/                   (files uploaded by user)
-#             .claude/                   (internal state)
+#       <account-uuid>/                # one per Claude account
+#         <sub-uuid>/                  # one or more per account
+#           local_<session-uuid>.json  # metadata
+#           local_<session-uuid>/      # conversation data
+#             audit.jsonl
+#             outputs/
+#             uploads/
+#             .claude/
+#
+# A "pair" in this script refers to a single
+# <account-uuid>/<sub-uuid>/ directory containing session files.
 # ============================================================
 
-find_session_dir() {
+# ============================================================
+#  list_session_pairs <base>
+#  Print each <account>/<sub>/ pair (full path) that contains
+#  one or more local_*.json files, one per line, sorted.
+#  Returns 1 if none found.
+# ============================================================
+list_session_pairs() {
     local base="$1"
+    [ -d "$base" ] || return 1
 
-    if [ ! -d "$base" ]; then
-        return 1
-    fi
+    local -a pairs=()
+    while IFS= read -r -d '' json_path; do
+        pairs+=("$(dirname "$json_path")")
+    done < <(find "$base" -mindepth 3 -maxdepth 3 -name "local_*.json" -print0 2>/dev/null)
 
-    # Look for the nested UUID directories containing local_*.json files
-    local session_dir
-    session_dir=$(find "$base" -name "local_*.json" -maxdepth 3 -print -quit 2>/dev/null)
-
-    if [ -z "$session_dir" ]; then
-        return 1
-    fi
-
-    # Return the parent directory of the first json file found
-    dirname "$session_dir"
+    [ ${#pairs[@]} -gt 0 ] || return 1
+    printf '%s\n' "${pairs[@]}" | sort -u
 }
 
 # ============================================================
-#  Detect username from paths inside session JSON files
+#  pair_session_count <pair-dir>
 # ============================================================
-detect_username_in_sessions() {
-    local dir="$1"
-    # Look at a few JSON files for /Users/<username>/ patterns
-    local username
-    username=$(grep -ohm1 '/Users/[^/]*/' "$dir"/local_*.json 2>/dev/null | head -1 | sed 's|/Users/||;s|/||')
+pair_session_count() {
+    local pair="$1"
+    local count=0
+    local f
+    for f in "$pair"/local_*.json; do
+        [ -f "$f" ] && count=$((count + 1))
+    done
+    echo "$count"
+}
+
+# ============================================================
+#  detect_source_username <pair-dir> [<pair-dir>...]
+#  Look at JSON files for /Users/<name>/ patterns.
+# ============================================================
+detect_source_username() {
+    local pair username=""
+    for pair in "$@"; do
+        username=$(grep -ohm1 '/Users/[^/]*/' "$pair"/local_*.json 2>/dev/null \
+                   | head -1 | sed 's|/Users/||;s|/||')
+        [ -n "$username" ] && break
+    done
     echo "$username"
+}
+
+# ============================================================
+#  filter_pairs <pair>...
+#  Filter by --account / --sub flags. Prints matching pairs.
+# ============================================================
+filter_pairs() {
+    local pair
+    for pair in "$@"; do
+        local acc sub
+        acc=$(basename "$(dirname "$pair")")
+        sub=$(basename "$pair")
+        if [ -n "$ACCOUNT_UUID" ] && [ "$acc" != "$ACCOUNT_UUID" ]; then
+            continue
+        fi
+        if [ -n "$SUB_UUID" ] && [ "$sub" != "$SUB_UUID" ]; then
+            continue
+        fi
+        echo "$pair"
+    done
+}
+
+# ============================================================
+#  select_pairs <allow_all> <base>
+#  Resolve which pairs the user wants to act on.
+#  - Honors --account / --sub / --all flags
+#  - If allow_all=true and SELECT_ALL=true, returns all
+#  - If a single pair matches, returns it without prompting
+#  - Otherwise prints a menu to stderr and reads choice
+#  Prints selected pair paths to stdout, one per line.
+# ============================================================
+select_pairs() {
+    local allow_all="$1"
+    local base="$2"
+
+    local -a all_pairs=()
+    while IFS= read -r p; do
+        all_pairs+=("$p")
+    done < <(list_session_pairs "$base" 2>/dev/null || true)
+
+    if [ ${#all_pairs[@]} -eq 0 ]; then
+        return 1
+    fi
+
+    local -a pairs=()
+    while IFS= read -r p; do
+        pairs+=("$p")
+    done < <(filter_pairs "${all_pairs[@]}")
+
+    if [ ${#pairs[@]} -eq 0 ]; then
+        echo -e "${RED}No (account/sub) pair matched --account/--sub filter.${NC}" >&2
+        echo "  Available pairs:" >&2
+        local p acc sub
+        for p in "${all_pairs[@]}"; do
+            acc=$(basename "$(dirname "$p")")
+            sub=$(basename "$p")
+            echo "    account=$acc sub=$sub" >&2
+        done
+        return 1
+    fi
+
+    if [ "$SELECT_ALL" = "true" ] && [ "$allow_all" = "true" ]; then
+        printf '%s\n' "${pairs[@]}"
+        return 0
+    fi
+
+    if [ ${#pairs[@]} -eq 1 ]; then
+        printf '%s\n' "${pairs[@]}"
+        return 0
+    fi
+
+    {
+        echo ""
+        echo -e "${BOLD}Multiple (account-uuid / sub-uuid) pairs found${NC}"
+        echo "============================================================"
+        echo ""
+        local idx=1 p acc sub count
+        for p in "${pairs[@]}"; do
+            acc=$(basename "$(dirname "$p")")
+            sub=$(basename "$p")
+            count=$(pair_session_count "$p")
+            printf "  %d) account: %s\n" "$idx" "$acc"
+            printf "     sub:     %s\n" "$sub"
+            printf "     sessions: %d\n\n" "$count"
+            idx=$((idx + 1))
+        done
+        if [ "$allow_all" = "true" ]; then
+            echo "  A) All pairs"
+            echo ""
+            echo -n "  Select [1-${#pairs[@]} or A]: "
+        else
+            echo -n "  Select [1-${#pairs[@]}]: "
+        fi
+    } >&2
+
+    local choice
+    if ! read -r choice </dev/tty; then
+        echo -e "${RED}Could not read selection (no tty).${NC}" >&2
+        echo "  Use --account=<uuid> --sub=<uuid> or --all for non-interactive runs." >&2
+        return 1
+    fi
+
+    if [ "$allow_all" = "true" ] && [[ "$choice" =~ ^[Aa]$ ]]; then
+        printf '%s\n' "${pairs[@]}"
+        return 0
+    fi
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#pairs[@]}" ]; then
+        echo -e "${RED}Invalid selection: $choice${NC}" >&2
+        return 1
+    fi
+
+    echo "${pairs[$((choice - 1))]}"
 }
 
 # ============================================================
@@ -94,23 +228,29 @@ show_usage() {
     echo "  backup     Create a backup of all sessions on this Mac"
     echo ""
     echo "Options:"
-    echo "  --force    Overwrite existing sessions during install"
-    echo "  --dry-run  Show what would be done without making changes"
-    echo "  --help     Show this help message"
+    echo "  --force                Overwrite existing sessions during install"
+    echo "  --dry-run              Show what would be done without making changes"
+    echo "  --account=<uuid>       Pre-select an account-uuid (skip prompt)"
+    echo "  --sub=<uuid>           Pre-select a sub-uuid (skip prompt)"
+    echo "  --all                  Select all (account/sub) pairs (export only)"
+    echo "  --help                 Show this help message"
     echo ""
     echo "Environment variables:"
-    echo "  COWORK_STAGING_DIR  Override staging directory"
-    echo "                      (default: ~/cowork-migration)"
+    echo "  COWORK_STAGING_DIR     Override staging directory"
+    echo "                         (default: ~/cowork-migration)"
     echo ""
     echo "Examples:"
-    echo "  # On source Mac (the one you're migrating FROM):"
+    echo "  # Interactive: prompts if multiple (account/sub) pairs exist"
     echo "  ./migrate.sh export"
     echo ""
-    echo "  # Transfer ~/cowork-migration folder to target Mac, then:"
-    echo "  ./migrate.sh install"
+    echo "  # Non-interactive: pick a specific pair"
+    echo "  ./migrate.sh export --account=AAA-... --sub=BBB-..."
     echo ""
-    echo "  # Force-overwrite a session that transferred with empty data:"
-    echo "  ./migrate.sh install --force"
+    echo "  # Export every pair on this Mac"
+    echo "  ./migrate.sh export --all"
+    echo ""
+    echo "  # Install everything in staging onto the target Mac"
+    echo "  ./migrate.sh install"
     echo ""
 }
 
@@ -121,50 +261,79 @@ do_list() {
     echo ""
     echo -e "${BOLD}Cowork Sessions on this Mac${NC}"
     echo "============================================================"
-    echo ""
 
-    local session_dir
-    session_dir=$(find_session_dir "$SESSION_BASE")
+    local -a all_pairs=()
+    while IFS= read -r p; do
+        all_pairs+=("$p")
+    done < <(list_session_pairs "$SESSION_BASE" 2>/dev/null || true)
 
-    if [ $? -ne 0 ] || [ -z "$session_dir" ]; then
+    if [ ${#all_pairs[@]} -eq 0 ]; then
+        echo ""
         echo -e "${RED}No Cowork sessions found.${NC}"
-        echo "Make sure Claude Desktop has been opened in Cowork mode."
+        echo "  Expected location: $SESSION_BASE"
+        echo "  Make sure Claude Desktop has been opened in Cowork mode."
         exit 1
     fi
 
-    local count=0
-    local archived=0
+    local -a pairs=()
+    while IFS= read -r p; do
+        pairs+=("$p")
+    done < <(filter_pairs "${all_pairs[@]}")
 
-    # Print header
-    printf "  %-4s  %-45s  %-12s  %s\n" "#" "TITLE" "DATE" "STATUS"
-    printf "  %-4s  %-45s  %-12s  %s\n" "---" "---------------------------------------------" "------------" "--------"
+    if [ ${#pairs[@]} -eq 0 ]; then
+        echo ""
+        echo -e "${RED}No pairs matched the --account/--sub filter.${NC}"
+        exit 1
+    fi
 
-    for json_file in "$session_dir"/local_*.json; do
-        [ -f "$json_file" ] || continue
-        count=$((count + 1))
+    local total=0 archived_total=0
+    local pair acc sub count archived
+    for pair in "${pairs[@]}"; do
+        acc=$(basename "$(dirname "$pair")")
+        sub=$(basename "$pair")
+        echo ""
+        echo -e "  ${CYAN}account:${NC} $acc"
+        echo -e "  ${CYAN}sub:${NC}     $sub"
+        echo ""
+        printf "  %-4s  %-45s  %-12s  %s\n" "#" "TITLE" "DATE" "STATUS"
+        printf "  %-4s  %-45s  %-12s  %s\n" "---" "---------------------------------------------" "------------" "--------"
 
-        local title is_archived created_at date_str status
-        title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled')[:45])" 2>/dev/null || echo "Untitled")
-        is_archived=$(python3 -c "import json; print(json.load(open('$json_file')).get('isArchived', False))" 2>/dev/null || echo "False")
-        created_at=$(python3 -c "
+        count=0
+        archived=0
+        local json_file title is_archived created_at status
+        for json_file in "$pair"/local_*.json; do
+            [ -f "$json_file" ] || continue
+            count=$((count + 1))
+
+            title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled')[:45])" 2>/dev/null || echo "Untitled")
+            is_archived=$(python3 -c "import json; print(json.load(open('$json_file')).get('isArchived', False))" 2>/dev/null || echo "False")
+            created_at=$(python3 -c "
 import json, datetime
 ts = json.load(open('$json_file')).get('createdAt', 0)
 print(datetime.datetime.fromtimestamp(ts/1000).strftime('%Y-%m-%d'))
 " 2>/dev/null || echo "unknown")
 
-        if [ "$is_archived" = "True" ]; then
-            status="archived"
-            archived=$((archived + 1))
-        else
-            status="active"
-        fi
+            if [ "$is_archived" = "True" ]; then
+                status="archived"
+                archived=$((archived + 1))
+            else
+                status="active"
+            fi
 
-        printf "  %-4s  %-45s  %-12s  %s\n" "$count" "$title" "$created_at" "$status"
+            printf "  %-4s  %-45s  %-12s  %s\n" "$count" "$title" "$created_at" "$status"
+        done
+
+        echo ""
+        echo "  Subtotal: $count sessions ($((count - archived)) active, $archived archived)"
+
+        total=$((total + count))
+        archived_total=$((archived_total + archived))
     done
 
     echo ""
-    echo "  Total: $count sessions ($((count - archived)) active, $archived archived)"
-    echo "  Location: $session_dir"
+    echo "============================================================"
+    echo "  Total: $total sessions across ${#pairs[@]} (account/sub) pair(s)"
+    echo "  Location: $SESSION_BASE"
     echo ""
 }
 
@@ -179,11 +348,7 @@ do_export() {
     echo "============================================================"
     echo ""
 
-    # Find session directory
-    local session_dir
-    session_dir=$(find_session_dir "$SESSION_BASE")
-
-    if [ $? -ne 0 ] || [ -z "$session_dir" ]; then
+    if ! list_session_pairs "$SESSION_BASE" >/dev/null 2>&1; then
         echo -e "${RED}ERROR: No Cowork sessions found.${NC}"
         echo ""
         echo "  Expected location: $SESSION_BASE"
@@ -192,42 +357,54 @@ do_export() {
         exit 1
     fi
 
-    local source_username
-    source_username=$(detect_username_in_sessions "$session_dir")
-    local current_username
-    current_username=$(whoami)
+    local -a selected=()
+    while IFS= read -r p; do
+        selected+=("$p")
+    done < <(select_pairs true "$SESSION_BASE")
 
-    echo "  Session directory: $session_dir"
-    echo "  Current username:  $current_username"
-    if [ -n "$source_username" ]; then
-        echo "  Paths reference:   /Users/$source_username/"
+    if [ ${#selected[@]} -eq 0 ]; then
+        echo -e "${RED}No pair selected.${NC}" >&2
+        exit 1
     fi
+
+    local current_username source_username
+    current_username=$(whoami)
+    source_username=$(detect_source_username "${selected[@]}")
+
+    echo ""
+    echo "  Current username: $current_username"
+    if [ -n "$source_username" ]; then
+        echo "  Paths reference:  /Users/$source_username/"
+    fi
+    echo "  Selected pairs:   ${#selected[@]}"
+
+    local total_count=0 pair c
+    for pair in "${selected[@]}"; do
+        c=$(pair_session_count "$pair")
+        total_count=$((total_count + c))
+    done
+    echo "  Sessions to export: $total_count"
     echo ""
 
     if [ "$dry_run" = "true" ]; then
         echo -e "  ${YELLOW}DRY RUN - no files will be copied${NC}"
-        echo ""
-    fi
-
-    # Count sessions
-    local total_count=0
-    for f in "$session_dir"/local_*.json; do
-        [ -f "$f" ] && total_count=$((total_count + 1))
-    done
-
-    echo "  Found $total_count sessions to export"
-    echo ""
-
-    if [ "$dry_run" = "true" ]; then
         echo "  Would export to: $STAGING_DIR"
         echo ""
         return
     fi
 
-    # Create staging directory
     mkdir -p "$STAGING_DIR/sessions"
 
-    # Save metadata about the export
+    local pairs_json="" acc sub
+    for pair in "${selected[@]}"; do
+        acc=$(basename "$(dirname "$pair")")
+        sub=$(basename "$pair")
+        if [ -n "$pairs_json" ]; then
+            pairs_json="${pairs_json},"
+        fi
+        pairs_json="${pairs_json}{\"account\":\"$acc\",\"sub\":\"$sub\"}"
+    done
+
     cat > "$STAGING_DIR/migration_info.json" << METAEOF
 {
     "exported_from": "$(hostname)",
@@ -235,37 +412,44 @@ do_export() {
     "exported_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
     "source_username": "${source_username:-$current_username}",
     "session_count": $total_count,
+    "pair_count": ${#selected[@]},
+    "pairs": [${pairs_json}],
     "tool_version": "$VERSION"
 }
 METAEOF
 
-    # Copy this script into staging for convenience
     cp "$0" "$STAGING_DIR/migrate.sh" 2>/dev/null || true
     chmod +x "$STAGING_DIR/migrate.sh" 2>/dev/null || true
 
-    local copied=0
-    for json_file in "$session_dir"/local_*.json; do
-        [ -f "$json_file" ] || continue
-        local filename session_id title
-        filename=$(basename "$json_file")
-        session_id="${filename%.json}"
+    local copied=0 json_file filename session_id title source_session_dir file_count stage_pair
+    for pair in "${selected[@]}"; do
+        acc=$(basename "$(dirname "$pair")")
+        sub=$(basename "$pair")
+        stage_pair="$STAGING_DIR/sessions/$acc/$sub"
+        mkdir -p "$stage_pair"
 
-        title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled'))" 2>/dev/null || echo "Untitled")
-        echo -e "  ${GREEN}EXPORT${NC}  $title"
+        echo -e "  ${CYAN}pair${NC}    account=$acc"
+        echo -e "          sub=$sub"
 
-        # Copy JSON metadata
-        cp "$json_file" "$STAGING_DIR/sessions/$filename"
+        for json_file in "$pair"/local_*.json; do
+            [ -f "$json_file" ] || continue
+            filename=$(basename "$json_file")
+            session_id="${filename%.json}"
 
-        # Copy session directory (conversation logs, outputs, uploads)
-        local source_session_dir="$session_dir/$session_id"
-        if [ -d "$source_session_dir" ]; then
-            cp -R "$source_session_dir" "$STAGING_DIR/sessions/$session_id"
-            local file_count
-            file_count=$(find "$STAGING_DIR/sessions/$session_id" -type f 2>/dev/null | wc -l | tr -d ' ')
-            echo "          -> $file_count files"
-        fi
+            title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled'))" 2>/dev/null || echo "Untitled")
+            echo -e "  ${GREEN}EXPORT${NC}  $title"
 
-        copied=$((copied + 1))
+            cp "$json_file" "$stage_pair/$filename"
+
+            source_session_dir="$pair/$session_id"
+            if [ -d "$source_session_dir" ]; then
+                cp -R "$source_session_dir" "$stage_pair/$session_id"
+                file_count=$(find "$stage_pair/$session_id" -type f 2>/dev/null | wc -l | tr -d ' ')
+                echo "          -> $file_count files"
+            fi
+
+            copied=$((copied + 1))
+        done
     done
 
     local total_size
@@ -276,7 +460,7 @@ METAEOF
     echo -e "  ${GREEN}EXPORT COMPLETE${NC}"
     echo "============================================================"
     echo ""
-    echo "  Exported: $copied sessions"
+    echo "  Exported: $copied sessions across ${#selected[@]} pair(s)"
     echo "  Location: $STAGING_DIR"
     echo "  Size:     $total_size"
     echo ""
@@ -284,12 +468,6 @@ METAEOF
     echo ""
     echo "    cd ~/cowork-migration"
     echo "    ./migrate.sh install"
-    echo ""
-    echo "  Transfer options:"
-    echo "    - AirDrop the ~/cowork-migration folder"
-    echo "    - scp -r ~/cowork-migration user@target-mac.local:~/"
-    echo "    - Copy via USB/Thunderbolt drive"
-    echo "    - Copy via shared network folder"
     echo ""
 }
 
@@ -305,36 +483,40 @@ do_install() {
     echo "============================================================"
     echo ""
 
-    # Check staging directory exists
     if [ ! -d "$STAGING_DIR/sessions" ]; then
         echo -e "${RED}ERROR: No exported sessions found at:${NC}"
         echo "  $STAGING_DIR/sessions"
         echo ""
         echo "  Make sure you've copied the cowork-migration folder"
         echo "  from your source Mac to ~/cowork-migration on this Mac."
-        echo ""
-        echo "  Or set COWORK_STAGING_DIR to your custom location:"
-        echo "    COWORK_STAGING_DIR=/path/to/folder ./migrate.sh install"
         exit 1
     fi
 
-    # Find target session directory
-    local target_dir
-    target_dir=$(find_session_dir "$SESSION_BASE")
+    local -a staging_all=()
+    while IFS= read -r p; do
+        staging_all+=("$p")
+    done < <(list_session_pairs "$STAGING_DIR/sessions" 2>/dev/null || true)
 
-    if [ $? -ne 0 ] || [ -z "$target_dir" ]; then
-        echo -e "${RED}ERROR: No Cowork session directory found on this Mac.${NC}"
-        echo ""
-        echo "  Make sure Claude Desktop has been opened in Cowork mode"
-        echo "  at least once on this Mac before running install."
+    if [ ${#staging_all[@]} -eq 0 ]; then
+        echo -e "${RED}ERROR: No (account/sub) pairs found in staging.${NC}"
+        echo "  Expected layout: $STAGING_DIR/sessions/<account-uuid>/<sub-uuid>/"
+        echo "  The staging folder may have been exported by an older version of this tool."
         exit 1
     fi
 
-    # Read migration info if available
-    local source_username=""
+    local -a staging_pairs=()
+    while IFS= read -r p; do
+        staging_pairs+=("$p")
+    done < <(filter_pairs "${staging_all[@]}")
+
+    if [ ${#staging_pairs[@]} -eq 0 ]; then
+        echo -e "${RED}No staged pair matched --account/--sub filter.${NC}"
+        exit 1
+    fi
+
+    local source_username="" exported_from="" exported_at=""
     if [ -f "$STAGING_DIR/migration_info.json" ]; then
         source_username=$(python3 -c "import json; print(json.load(open('$STAGING_DIR/migration_info.json')).get('source_username', ''))" 2>/dev/null || echo "")
-        local exported_from exported_at
         exported_from=$(python3 -c "import json; print(json.load(open('$STAGING_DIR/migration_info.json')).get('exported_from', 'unknown'))" 2>/dev/null || echo "unknown")
         exported_at=$(python3 -c "import json; print(json.load(open('$STAGING_DIR/migration_info.json')).get('exported_at', 'unknown'))" 2>/dev/null || echo "unknown")
         echo "  Exported from: $exported_from"
@@ -345,7 +527,6 @@ do_install() {
     local target_username
     target_username=$(whoami)
 
-    # Determine if path rewriting is needed
     local needs_path_rewrite=false
     if [ -n "$source_username" ] && [ "$source_username" != "$target_username" ]; then
         needs_path_rewrite=true
@@ -354,115 +535,110 @@ do_install() {
         echo ""
     fi
 
-    local staged_count=0
-    for f in "$STAGING_DIR/sessions"/local_*.json; do
-        [ -f "$f" ] && staged_count=$((staged_count + 1))
-    done
-
-    local existing_count=0
-    for f in "$target_dir"/local_*.json; do
-        [ -f "$f" ] && existing_count=$((existing_count + 1))
-    done
-
-    echo "  Staged sessions:   $staged_count"
-    echo "  Existing sessions: $existing_count"
+    echo "  Staging pairs: ${#staging_pairs[@]}"
     if [ "$force" = "true" ]; then
-        echo -e "  Mode:              ${YELLOW}FORCE (will overwrite existing)${NC}"
+        echo -e "  Mode:          ${YELLOW}FORCE (will overwrite existing)${NC}"
     else
-        echo "  Mode:              Safe (skip existing)"
+        echo "  Mode:          Safe (skip existing)"
     fi
     if [ "$dry_run" = "true" ]; then
         echo -e "  ${YELLOW}DRY RUN - no files will be modified${NC}"
     fi
     echo ""
 
-    local copied=0
-    local skipped=0
-    local overwritten=0
-    local errors=0
+    local copied=0 skipped=0 overwritten=0 errors=0
+    local stage_pair acc sub target_pair json_file filename session_id title target_json
+    local staged_session_dir target_session_dir file_count inner_file
 
-    for json_file in "$STAGING_DIR/sessions"/local_*.json; do
-        [ -f "$json_file" ] || continue
+    for stage_pair in "${staging_pairs[@]}"; do
+        acc=$(basename "$(dirname "$stage_pair")")
+        sub=$(basename "$stage_pair")
+        target_pair="$SESSION_BASE/$acc/$sub"
 
-        local filename session_id title target_json
-        filename=$(basename "$json_file")
-        session_id="${filename%.json}"
-        target_json="$target_dir/$filename"
+        echo -e "  ${CYAN}pair${NC}    account=$acc"
+        echo -e "          sub=$sub"
 
-        title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled'))" 2>/dev/null || echo "Untitled")
+        if [ ! -d "$target_pair" ]; then
+            echo -e "          ${YELLOW}target dir does not exist; creating${NC}"
+            if [ "$dry_run" != "true" ]; then
+                mkdir -p "$target_pair"
+            fi
+        fi
 
-        # Check if session already exists
-        if [ -f "$target_json" ]; then
-            if [ "$force" = "true" ]; then
-                echo -e "  ${YELLOW}OVERWRITE${NC}  $title"
-                overwritten=$((overwritten + 1))
+        for json_file in "$stage_pair"/local_*.json; do
+            [ -f "$json_file" ] || continue
+
+            filename=$(basename "$json_file")
+            session_id="${filename%.json}"
+            target_json="$target_pair/$filename"
+
+            title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled'))" 2>/dev/null || echo "Untitled")
+
+            if [ -f "$target_json" ]; then
+                if [ "$force" = "true" ]; then
+                    echo -e "  ${YELLOW}OVERWRITE${NC}  $title"
+                    overwritten=$((overwritten + 1))
+                else
+                    echo -e "  ${YELLOW}SKIP${NC}       $title (already exists)"
+                    skipped=$((skipped + 1))
+                    continue
+                fi
             else
-                echo -e "  ${YELLOW}SKIP${NC}       $title (already exists)"
-                skipped=$((skipped + 1))
+                echo -e "  ${GREEN}INSTALL${NC}    $title"
+            fi
+
+            if [ "$dry_run" = "true" ]; then
+                copied=$((copied + 1))
                 continue
             fi
-        else
-            echo -e "  ${GREEN}INSTALL${NC}    $title"
-        fi
 
-        if [ "$dry_run" = "true" ]; then
-            copied=$((copied + 1))
-            continue
-        fi
-
-        # Copy JSON metadata
-        cp -f "$json_file" "$target_json"
-        if [ $? -ne 0 ]; then
-            echo -e "               ${RED}ERROR copying metadata${NC}"
-            errors=$((errors + 1))
-            continue
-        fi
-
-        # Rewrite paths if usernames differ
-        if [ "$needs_path_rewrite" = "true" ]; then
-            if grep -q "/Users/${source_username}/" "$target_json" 2>/dev/null; then
-                sed -i '' "s|/Users/${source_username}/|/Users/${target_username}/|g" "$target_json"
-            fi
-        fi
-
-        # Copy session directory
-        local staged_session_dir="$STAGING_DIR/sessions/$session_id"
-        local target_session_dir="$target_dir/$session_id"
-
-        if [ -d "$staged_session_dir" ]; then
-            # Remove existing directory if force mode
-            if [ "$force" = "true" ] && [ -d "$target_session_dir" ]; then
-                rm -rf "$target_session_dir"
-            fi
-
-            cp -R "$staged_session_dir" "$target_session_dir"
-            if [ $? -ne 0 ]; then
-                echo -e "               ${RED}ERROR copying session data${NC}"
+            if ! cp -f "$json_file" "$target_json"; then
+                echo -e "               ${RED}ERROR copying metadata${NC}"
                 errors=$((errors + 1))
                 continue
             fi
 
-            local file_count
-            file_count=$(find "$target_session_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
-            echo "               -> $file_count files"
-
-            # Rewrite paths inside session files
             if [ "$needs_path_rewrite" = "true" ]; then
-                find "$target_session_dir" \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" \) -print0 2>/dev/null | while IFS= read -r -d '' inner_file; do
-                    if grep -q "/Users/${source_username}/" "$inner_file" 2>/dev/null; then
-                        sed -i '' "s|/Users/${source_username}/|/Users/${target_username}/|g" "$inner_file"
-                    fi
-                done
+                if grep -q "/Users/${source_username}/" "$target_json" 2>/dev/null; then
+                    sed -i '' "s|/Users/${source_username}/|/Users/${target_username}/|g" "$target_json"
+                fi
             fi
-        fi
 
-        copied=$((copied + 1))
+            staged_session_dir="$stage_pair/$session_id"
+            target_session_dir="$target_pair/$session_id"
+
+            if [ -d "$staged_session_dir" ]; then
+                if [ "$force" = "true" ] && [ -d "$target_session_dir" ]; then
+                    rm -rf "$target_session_dir"
+                fi
+
+                if ! cp -R "$staged_session_dir" "$target_session_dir"; then
+                    echo -e "               ${RED}ERROR copying session data${NC}"
+                    errors=$((errors + 1))
+                    continue
+                fi
+
+                file_count=$(find "$target_session_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+                echo "               -> $file_count files"
+
+                if [ "$needs_path_rewrite" = "true" ]; then
+                    find "$target_session_dir" \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" \) -print0 2>/dev/null | while IFS= read -r -d '' inner_file; do
+                        if grep -q "/Users/${source_username}/" "$inner_file" 2>/dev/null; then
+                            sed -i '' "s|/Users/${source_username}/|/Users/${target_username}/|g" "$inner_file"
+                        fi
+                    done
+                fi
+            fi
+
+            copied=$((copied + 1))
+        done
     done
 
-    local final_count=0
-    for f in "$target_dir"/local_*.json; do
-        [ -f "$f" ] && final_count=$((final_count + 1))
-    done
+    local final_count=0 fp
+    while IFS= read -r fp; do
+        c=$(pair_session_count "$fp")
+        final_count=$((final_count + c))
+    done < <(list_session_pairs "$SESSION_BASE" 2>/dev/null || true)
 
     echo ""
     echo "============================================================"
@@ -486,7 +662,7 @@ do_install() {
 }
 
 # ============================================================
-#  BACKUP: Create a local backup
+#  BACKUP: Create a local backup of all pairs
 # ============================================================
 do_backup() {
     echo ""
@@ -494,11 +670,23 @@ do_backup() {
     echo "============================================================"
     echo ""
 
-    local session_dir
-    session_dir=$(find_session_dir "$SESSION_BASE")
+    local -a all_pairs=()
+    while IFS= read -r p; do
+        all_pairs+=("$p")
+    done < <(list_session_pairs "$SESSION_BASE" 2>/dev/null || true)
 
-    if [ $? -ne 0 ] || [ -z "$session_dir" ]; then
+    if [ ${#all_pairs[@]} -eq 0 ]; then
         echo -e "${RED}ERROR: No Cowork sessions found.${NC}"
+        exit 1
+    fi
+
+    local -a pairs=()
+    while IFS= read -r p; do
+        pairs+=("$p")
+    done < <(filter_pairs "${all_pairs[@]}")
+
+    if [ ${#pairs[@]} -eq 0 ]; then
+        echo -e "${RED}No pairs matched the --account/--sub filter.${NC}"
         exit 1
     fi
 
@@ -506,14 +694,20 @@ do_backup() {
     local backup_dir="$HOME/$backup_name"
 
     echo "  Creating backup at: $backup_dir"
+    echo "  Pairs:              ${#pairs[@]}"
     echo ""
 
     mkdir -p "$backup_dir"
-    cp -R "$session_dir"/ "$backup_dir/"
 
-    local count=0
-    for f in "$backup_dir"/local_*.json; do
-        [ -f "$f" ] && count=$((count + 1))
+    local total=0 pair acc sub c
+    for pair in "${pairs[@]}"; do
+        acc=$(basename "$(dirname "$pair")")
+        sub=$(basename "$pair")
+        mkdir -p "$backup_dir/$acc/$sub"
+        cp -R "$pair"/. "$backup_dir/$acc/$sub/"
+        c=$(pair_session_count "$pair")
+        total=$((total + c))
+        echo "  Backed up: account=$acc sub=$sub ($c sessions)"
     done
 
     local size
@@ -521,14 +715,14 @@ do_backup() {
 
     echo ""
     echo -e "  ${GREEN}BACKUP COMPLETE${NC}"
-    echo "  Sessions: $count"
+    echo "  Sessions: $total"
     echo "  Size:     $size"
     echo "  Location: $backup_dir"
     echo ""
 }
 
 # ============================================================
-#  VERIFY: Check migration integrity
+#  VERIFY: Check migration integrity across all pairs
 # ============================================================
 do_verify() {
     echo ""
@@ -536,104 +730,109 @@ do_verify() {
     echo "============================================================"
     echo ""
 
-    # Find session directory on this Mac
-    local session_dir
-    session_dir=$(find_session_dir "$SESSION_BASE")
+    local -a all_pairs=()
+    while IFS= read -r p; do
+        all_pairs+=("$p")
+    done < <(list_session_pairs "$SESSION_BASE" 2>/dev/null || true)
 
-    if [ $? -ne 0 ] || [ -z "$session_dir" ]; then
+    if [ ${#all_pairs[@]} -eq 0 ]; then
         echo -e "${RED}ERROR: No Cowork sessions found on this Mac.${NC}"
         exit 1
     fi
 
-    # Check if staging directory exists for comparison
+    local -a pairs=()
+    while IFS= read -r p; do
+        pairs+=("$p")
+    done < <(filter_pairs "${all_pairs[@]}")
+
+    if [ ${#pairs[@]} -eq 0 ]; then
+        echo -e "${RED}No pairs matched the --account/--sub filter.${NC}"
+        exit 1
+    fi
+
     local has_staging=false
-    if [ -d "$STAGING_DIR/sessions" ]; then
+    if [ -d "$STAGING_DIR/sessions" ] && list_session_pairs "$STAGING_DIR/sessions" >/dev/null 2>&1; then
         has_staging=true
     fi
 
-    local total=0
-    local healthy=0
-    local warnings=0
-    local errors=0
-    local issues=""
+    local total=0 healthy=0 warnings=0 errors=0 issues=""
+    local current_username
+    current_username=$(whoami)
 
-    for json_file in "$session_dir"/local_*.json; do
-        [ -f "$json_file" ] || continue
-        total=$((total + 1))
+    local pair acc sub json_file filename session_id title session_ok checks
+    local sess_dir stale_paths stale_user staged_dir staged_files installed_files
 
-        local filename session_id title session_ok
-        filename=$(basename "$json_file")
-        session_id="${filename%.json}"
-        session_ok=true
+    for pair in "${pairs[@]}"; do
+        acc=$(basename "$(dirname "$pair")")
+        sub=$(basename "$pair")
+        echo ""
+        echo -e "  ${CYAN}pair${NC}  account=$acc  sub=$sub"
+        echo ""
 
-        title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled')[:50])" 2>/dev/null || echo "Untitled")
+        for json_file in "$pair"/local_*.json; do
+            [ -f "$json_file" ] || continue
+            total=$((total + 1))
 
-        local checks=""
-        local check_failed=false
+            filename=$(basename "$json_file")
+            session_id="${filename%.json}"
+            session_ok=true
+            checks=""
 
-        # Check 1: JSON is valid
-        if ! python3 -c "import json; json.load(open('$json_file'))" 2>/dev/null; then
-            checks="${checks}  ${RED}FAIL${NC} Invalid JSON metadata\n"
-            check_failed=true
-            errors=$((errors + 1))
-            session_ok=false
-        fi
+            title=$(python3 -c "import json; print(json.load(open('$json_file')).get('title', 'Untitled')[:50])" 2>/dev/null || echo "Untitled")
 
-        # Check 2: Session directory exists
-        local sess_dir="$session_dir/$session_id"
-        if [ ! -d "$sess_dir" ]; then
-            checks="${checks}  ${YELLOW}WARN${NC} No session directory (metadata only)\n"
-            warnings=$((warnings + 1))
-            session_ok=false
-        else
-            # Check 3: audit.jsonl exists and is non-empty
-            if [ ! -f "$sess_dir/audit.jsonl" ]; then
-                checks="${checks}  ${YELLOW}WARN${NC} Missing audit.jsonl (no conversation log)\n"
-                warnings=$((warnings + 1))
-                session_ok=false
-            elif [ ! -s "$sess_dir/audit.jsonl" ]; then
-                checks="${checks}  ${YELLOW}WARN${NC} Empty audit.jsonl (conversation log has no data)\n"
-                warnings=$((warnings + 1))
+            if ! python3 -c "import json; json.load(open('$json_file'))" 2>/dev/null; then
+                checks="${checks}  ${RED}FAIL${NC} Invalid JSON metadata\n"
+                errors=$((errors + 1))
                 session_ok=false
             fi
 
-            # Check 4: No stale source-Mac paths remaining
-            local current_username
-            current_username=$(whoami)
-            local stale_paths
-            stale_paths=$(grep -r "/Users/" "$sess_dir" --include="*.json" --include="*.jsonl" 2>/dev/null | grep -v "/Users/${current_username}/" | head -1 || true)
-            if [ -n "$stale_paths" ]; then
-                local stale_user
-                stale_user=$(echo "$stale_paths" | grep -o '/Users/[^/]*/' | head -1 | sed 's|/Users/||;s|/||')
-                checks="${checks}  ${YELLOW}WARN${NC} Contains paths for /Users/${stale_user}/ (not rewritten)\n"
+            sess_dir="$pair/$session_id"
+            if [ ! -d "$sess_dir" ]; then
+                checks="${checks}  ${YELLOW}WARN${NC} No session directory (metadata only)\n"
                 warnings=$((warnings + 1))
                 session_ok=false
-            fi
+            else
+                if [ ! -f "$sess_dir/audit.jsonl" ]; then
+                    checks="${checks}  ${YELLOW}WARN${NC} Missing audit.jsonl (no conversation log)\n"
+                    warnings=$((warnings + 1))
+                    session_ok=false
+                elif [ ! -s "$sess_dir/audit.jsonl" ]; then
+                    checks="${checks}  ${YELLOW}WARN${NC} Empty audit.jsonl (conversation log has no data)\n"
+                    warnings=$((warnings + 1))
+                    session_ok=false
+                fi
 
-            # Check 5: Compare with staging if available
-            if [ "$has_staging" = "true" ] && [ -f "$STAGING_DIR/sessions/$filename" ]; then
-                local staged_dir="$STAGING_DIR/sessions/$session_id"
-                if [ -d "$staged_dir" ]; then
-                    local staged_files installed_files
-                    staged_files=$(find "$staged_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
-                    installed_files=$(find "$sess_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
-                    if [ "$installed_files" -lt "$staged_files" ]; then
-                        checks="${checks}  ${YELLOW}WARN${NC} Missing files: $installed_files installed vs $staged_files exported\n"
-                        warnings=$((warnings + 1))
-                        session_ok=false
+                stale_paths=$(grep -r "/Users/" "$sess_dir" --include="*.json" --include="*.jsonl" 2>/dev/null | grep -v "/Users/${current_username}/" | head -1 || true)
+                if [ -n "$stale_paths" ]; then
+                    stale_user=$(echo "$stale_paths" | grep -o '/Users/[^/]*/' | head -1 | sed 's|/Users/||;s|/||')
+                    checks="${checks}  ${YELLOW}WARN${NC} Contains paths for /Users/${stale_user}/ (not rewritten)\n"
+                    warnings=$((warnings + 1))
+                    session_ok=false
+                fi
+
+                if [ "$has_staging" = "true" ] && [ -f "$STAGING_DIR/sessions/$acc/$sub/$filename" ]; then
+                    staged_dir="$STAGING_DIR/sessions/$acc/$sub/$session_id"
+                    if [ -d "$staged_dir" ]; then
+                        staged_files=$(find "$staged_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+                        installed_files=$(find "$sess_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+                        if [ "$installed_files" -lt "$staged_files" ]; then
+                            checks="${checks}  ${YELLOW}WARN${NC} Missing files: $installed_files installed vs $staged_files exported\n"
+                            warnings=$((warnings + 1))
+                            session_ok=false
+                        fi
                     fi
                 fi
             fi
-        fi
 
-        if [ "$session_ok" = "true" ]; then
-            healthy=$((healthy + 1))
-            echo -e "  ${GREEN}OK${NC}    $title"
-        else
-            echo -e "  ${YELLOW}ISSUE${NC} $title"
-            echo -e "$checks"
-            issues="${issues}  - $title\n"
-        fi
+            if [ "$session_ok" = "true" ]; then
+                healthy=$((healthy + 1))
+                echo -e "  ${GREEN}OK${NC}    $title"
+            else
+                echo -e "  ${YELLOW}ISSUE${NC} $title"
+                echo -e "$checks"
+                issues="${issues}  - $title\n"
+            fi
+        done
     done
 
     echo ""
@@ -641,7 +840,7 @@ do_verify() {
     echo -e "  ${BOLD}VERIFICATION RESULTS${NC}"
     echo "============================================================"
     echo ""
-    echo "  Total sessions: $total"
+    echo "  Total sessions: $total across ${#pairs[@]} (account/sub) pair(s)"
     echo -e "  ${GREEN}Healthy:${NC}  $healthy"
     echo -e "  ${YELLOW}Warnings:${NC} $warnings"
     echo -e "  ${RED}Errors:${NC}   $errors"
@@ -671,7 +870,6 @@ do_verify() {
 #  MAIN
 # ============================================================
 
-# Parse flags
 FORCE=false
 DRY_RUN=false
 COMMAND="${1:-}"
@@ -682,6 +880,9 @@ for arg in "$@"; do
     case "$arg" in
         --force) FORCE=true ;;
         --dry-run) DRY_RUN=true ;;
+        --all) SELECT_ALL=true ;;
+        --account=*) ACCOUNT_UUID="${arg#--account=}" ;;
+        --sub=*) SUB_UUID="${arg#--sub=}" ;;
         --help) show_usage; exit 0 ;;
     esac
 done
